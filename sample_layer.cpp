@@ -6,6 +6,10 @@
 
 #include <mutex>
 #include <map>
+#include <atomic>
+
+#define GPUVIS_TRACE_IMPLEMENTATION
+#include "gpuvis_trace_utils.h"
 
 #undef VK_LAYER_EXPORT
 #if defined(WIN32)
@@ -36,6 +40,8 @@ struct CommandStats
 };
 
 std::map<VkCommandBuffer, CommandStats> commandbuffer_stats;
+
+std::atomic<uint64_t> maxRegionID;
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 // Layer init and shutdown
@@ -123,10 +129,8 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL SampleLayer_CreateDevice(
   VkLayerDispatchTable dispatchTable;
   dispatchTable.GetDeviceProcAddr = (PFN_vkGetDeviceProcAddr)gdpa(*pDevice, "vkGetDeviceProcAddr");
   dispatchTable.DestroyDevice = (PFN_vkDestroyDevice)gdpa(*pDevice, "vkDestroyDevice");
-  dispatchTable.BeginCommandBuffer = (PFN_vkBeginCommandBuffer)gdpa(*pDevice, "vkBeginCommandBuffer");
-  dispatchTable.CmdDraw = (PFN_vkCmdDraw)gdpa(*pDevice, "vkCmdDraw");
-  dispatchTable.CmdDrawIndexed = (PFN_vkCmdDrawIndexed)gdpa(*pDevice, "vkCmdDrawIndexed");
-  dispatchTable.EndCommandBuffer = (PFN_vkEndCommandBuffer)gdpa(*pDevice, "vkEndCommandBuffer");
+  dispatchTable.AcquireNextImageKHR = (PFN_vkAcquireNextImageKHR)gdpa(*pDevice, "vkAcquireNextImageKHR");
+  dispatchTable.QueuePresentKHR = (PFN_vkQueuePresentKHR)gdpa(*pDevice, "vkQueuePresentKHR");
   
   // store the table by key
   {
@@ -146,55 +150,34 @@ VK_LAYER_EXPORT void VKAPI_CALL SampleLayer_DestroyDevice(VkDevice device, const
 ///////////////////////////////////////////////////////////////////////////////////////////
 // Actual layer implementation
 
-VK_LAYER_EXPORT VkResult VKAPI_CALL SampleLayer_BeginCommandBuffer(VkCommandBuffer commandBuffer, const VkCommandBufferBeginInfo* pBeginInfo)
+VK_LAYER_EXPORT VkResult VKAPI_CALL SampleLayer_AcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout, VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
 {
-  scoped_lock l(global_lock);
-  commandbuffer_stats[commandBuffer] = CommandStats();
-  return device_dispatch[GetKey(commandBuffer)].BeginCommandBuffer(commandBuffer, pBeginInfo);
+	uint64_t regionID = maxRegionID++;
+
+	gpuvis_trace_printf( "vkAcquireNextImageKHR begin_ctx=%lu\n", regionID );
+	VkResult res = device_dispatch[GetKey(device)].AcquireNextImageKHR( device, swapchain, timeout, semaphore, fence, pImageIndex);
+	gpuvis_trace_printf( "vkAcquireNextImageKHR end_ctx=%lu\n", regionID );
+
+	if ( res == VK_SUCCESS && pImageIndex != nullptr )
+	{
+		gpuvis_trace_printf( "vkAcquireNextImageKHR got image %d\n", *pImageIndex );
+	}
+
+	return res;
 }
 
-VK_LAYER_EXPORT void VKAPI_CALL SampleLayer_CmdDraw(
-    VkCommandBuffer                             commandBuffer,
-    uint32_t                                    vertexCount,
-    uint32_t                                    instanceCount,
-    uint32_t                                    firstVertex,
-    uint32_t                                    firstInstance)
+VK_LAYER_EXPORT VkResult VKAPI_CALL SampleLayer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo)
 {
-  scoped_lock l(global_lock);
+	uint64_t regionID = maxRegionID++;
 
-  commandbuffer_stats[commandBuffer].drawCount++;
-  commandbuffer_stats[commandBuffer].instanceCount += instanceCount;
-  commandbuffer_stats[commandBuffer].vertCount += instanceCount*vertexCount;
+	gpuvis_trace_printf( "vkQueuePresentKHR image %d begin_ctx=%lu\n", pPresentInfo->pImageIndices[0], regionID );
+	VkResult res = device_dispatch[GetKey(queue)].QueuePresentKHR( queue, pPresentInfo );
+	gpuvis_trace_printf( "vkQueuePresentKHR image %d end_ctx=%lu\n", pPresentInfo->pImageIndices[0], regionID );
 
-  device_dispatch[GetKey(commandBuffer)].CmdDraw(commandBuffer, vertexCount, instanceCount, firstVertex, firstInstance);
+	return res;
 }
 
-VK_LAYER_EXPORT void VKAPI_CALL SampleLayer_CmdDrawIndexed(
-    VkCommandBuffer                             commandBuffer,
-    uint32_t                                    indexCount,
-    uint32_t                                    instanceCount,
-    uint32_t                                    firstIndex,
-    int32_t                                     vertexOffset,
-    uint32_t                                    firstInstance)
-{
-  scoped_lock l(global_lock);
 
-  commandbuffer_stats[commandBuffer].drawCount++;
-  commandbuffer_stats[commandBuffer].instanceCount += instanceCount;
-  commandbuffer_stats[commandBuffer].vertCount += instanceCount*indexCount;
-
-  device_dispatch[GetKey(commandBuffer)].CmdDrawIndexed(commandBuffer, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
-}
-
-VK_LAYER_EXPORT VkResult VKAPI_CALL SampleLayer_EndCommandBuffer(VkCommandBuffer commandBuffer)
-{
-  scoped_lock l(global_lock);
-
-  CommandStats &s = commandbuffer_stats[commandBuffer];
-  printf("Command buffer %p ended with %u draws, %u instances and %u vertices", commandBuffer, s.drawCount, s.instanceCount, s.vertCount);
-
-  return device_dispatch[GetKey(commandBuffer)].EndCommandBuffer(commandBuffer);
-}
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 // Enumeration function
@@ -264,11 +247,9 @@ VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL SampleLayer_GetDeviceProcAddr(VkDe
   GETPROCADDR(EnumerateDeviceExtensionProperties);
   GETPROCADDR(CreateDevice);
   GETPROCADDR(DestroyDevice);
-  GETPROCADDR(BeginCommandBuffer);
-  GETPROCADDR(CmdDraw);
-  GETPROCADDR(CmdDrawIndexed);
-  GETPROCADDR(EndCommandBuffer);
-  
+  GETPROCADDR(AcquireNextImageKHR);
+  GETPROCADDR(QueuePresentKHR);
+
   {
     scoped_lock l(global_lock);
     return device_dispatch[GetKey(device)].GetDeviceProcAddr(device, pName);
@@ -290,10 +271,9 @@ VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL SampleLayer_GetInstanceProcAddr(Vk
   GETPROCADDR(EnumerateDeviceExtensionProperties);
   GETPROCADDR(CreateDevice);
   GETPROCADDR(DestroyDevice);
-  GETPROCADDR(BeginCommandBuffer);
-  GETPROCADDR(CmdDraw);
-  GETPROCADDR(CmdDrawIndexed);
-  GETPROCADDR(EndCommandBuffer);
+  GETPROCADDR(AcquireNextImageKHR);
+  GETPROCADDR(QueuePresentKHR);
+
 
   {
     scoped_lock l(global_lock);
